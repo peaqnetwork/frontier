@@ -30,6 +30,7 @@ use sp_std::vec::Vec;
 
 pub use evm::{
 	backend::{Basic as Account, Log},
+	executor::stack::IsPrecompileResult,
 	Config, ExitReason,
 };
 
