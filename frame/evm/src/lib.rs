@@ -975,8 +975,11 @@ impl<T: Config> EVM<T::AccountId> for Pallet<T> {
 				None,
 				None,
 				vec![],
-				true,
-				true,
+				match mode {
+					ExecutionMode::View => false,
+					_ => true
+				},
+				false,
 				&config,
 			);
 
@@ -996,33 +999,6 @@ impl<T: Config> EVM<T::AccountId> for Pallet<T> {
 				}
 				Err(e) => TransactionOutcome::Rollback(Err(e.error.into())),
 			}
-			// match result {
-			// 	Ok(info) => match mode {
-			// 		ExecutionMode::Execute => {
-			// 			if info.exit_reason.is_succeed() {
-			// 				Pallet::<T>::deposit_event(Event::<T>::Executed {
-			// 					address: context.sender
-			// 				});
-			// 				TransactionOutcome::Commit(Ok(info))
-			// 			} else {
-			// 				Pallet::<T>::deposit_event(Event::<T>::ExecutedFailed {
-			// 					from: context.sender,
-			// 					contract: context.contract,
-			// 					exit_reason: info.exit_reason.clone(),
-			// 					output: info.value.clone(),
-			// 					logs: info.logs.clone(),
-			// 					used_gas: info.used_gas.unique_saturated_into(),
-			// 					used_storage: Default::default(),
-			// 				});
-			// 				TransactionOutcome::Rollback(Ok(info))
-			// 			}
-			// 		}
-			// 		ExecutionMode::View | ExecutionMode::EstimateGas => {
-			// 			TransactionOutcome::Rollback(Ok(info))
-			// 		}
-			// 	},
-			// 	Err(e) => TransactionOutcome::Rollback(Err(e)),
-			// }
 		})
 	}
 }
