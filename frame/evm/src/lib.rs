@@ -65,7 +65,8 @@ pub mod runner;
 mod tests;
 
 use frame_support::{
-	dispatch::{DispatchResultWithPostInfo, Pays, PostDispatchInfo},
+	dispatch::{DispatchError, DispatchResultWithPostInfo, Pays, PostDispatchInfo},
+	storage::TransactionOutcome,
 	traits::{
 		tokens::fungible::Inspect, Currency, ExistenceRequirement, FindAuthor, Get, Imbalance,
 		OnUnbalanced, SignedImbalance, WithdrawReasons,
@@ -74,9 +75,12 @@ use frame_support::{
 };
 use frame_system::RawOrigin;
 use impl_trait_for_tuples::impl_for_tuples;
-use sp_core::{Hasher, H160, H256, U256};
+use sp_core::{Decode, Encode, Hasher, RuntimeDebug, H160, H256, U256};
 use sp_runtime::{
-	traits::{BadOrigin, Saturating, UniqueSaturatedInto, Zero},
+	traits::{
+		AtLeast32BitUnsigned, BadOrigin, MaybeSerializeDeserialize, Saturating,
+		UniqueSaturatedInto, Zero,
+	},
 	AccountId32, DispatchErrorWithPostInfo,
 };
 use sp_std::{cmp::min, vec::Vec};
@@ -912,5 +916,113 @@ impl<T> OnCreate<T> for Tuple {
 		for_tuples!(#(
 			Tuple::on_create(owner, contract);
 		)*)
+	}
+}
+
+#[derive(Encode, Decode, Eq, PartialEq, Copy, Clone, RuntimeDebug)]
+pub enum ExecutionMode {
+	Execute,
+	/// Discard any state changes
+	View,
+	/// Also discard any state changes and use estimate gas mode for evm config
+	EstimateGas,
+}
+
+#[derive(Encode, Decode, Eq, PartialEq, Copy, Clone, RuntimeDebug)]
+pub struct InvokeContext {
+	pub contract: H160,
+	/// similar to msg.sender
+	pub sender: H160,
+	/// similar to tx.origin
+	pub origin: H160,
+}
+
+/// An abstraction of EVM for EVMBridge
+/// An abstraction of EVM for EVMBridge
+pub trait EVM<AccountId> {
+	fn execute(
+		context: InvokeContext,
+		input: Vec<u8>,
+		value: U256,
+		gas_limit: u64,
+		storage_limit: u32,
+		mode: ExecutionMode,
+	) -> Result<CallInfo, sp_runtime::DispatchError>;
+}
+
+impl<T: Config> EVM<T::AccountId> for Pallet<T> {
+	fn execute(
+		context: InvokeContext,
+		input: Vec<u8>,
+		value: U256,
+		gas_limit: u64,
+		storage_limit: u32,
+		mode: ExecutionMode,
+	) -> Result<CallInfo, DispatchError> {
+		let mut config = T::config().clone();
+		if let ExecutionMode::EstimateGas = mode {
+			config.estimate = true;
+		}
+
+		frame_support::storage::with_transaction(|| {
+			let result = T::Runner::call(
+				context.sender,
+				context.origin,
+				input,
+				value,
+				gas_limit,
+				None,
+				None,
+				None,
+				vec![],
+				true,
+				true,
+				&config,
+			);
+
+			match result {
+				Ok(info) => {
+					if info.exit_reason.is_succeed() {
+						Pallet::<T>::deposit_event(Event::<T>::Executed {
+							address: context.sender,
+						});
+						TransactionOutcome::Commit(Ok(info))
+					} else {
+						Pallet::<T>::deposit_event(Event::<T>::ExecutedFailed {
+							address: context.sender,
+						});
+						TransactionOutcome::Rollback(Ok(info))
+					}
+				}
+				Err(e) => TransactionOutcome::Rollback(Err(e.error.into())),
+			}
+			// match result {
+			// 	Ok(info) => match mode {
+			// 		ExecutionMode::Execute => {
+			// 			if info.exit_reason.is_succeed() {
+			// 				Pallet::<T>::deposit_event(Event::<T>::Executed {
+			// 					address: context.sender
+			// 				});
+			// 				TransactionOutcome::Commit(Ok(info))
+			// 			} else {
+			// 				Pallet::<T>::deposit_event(Event::<T>::ExecutedFailed {
+			// 					from: context.sender,
+			// 					contract: context.contract,
+			// 					exit_reason: info.exit_reason.clone(),
+			// 					output: info.value.clone(),
+			// 					logs: info.logs.clone(),
+			// 					used_gas: info.used_gas.unique_saturated_into(),
+			// 					used_storage: Default::default(),
+			// 				});
+			// 				TransactionOutcome::Rollback(Ok(info))
+			// 			}
+			// 		}
+			// 		ExecutionMode::View | ExecutionMode::EstimateGas => {
+			// 			TransactionOutcome::Rollback(Ok(info))
+			// 		}
+			// 	},
+			// 	Err(e) => TransactionOutcome::Rollback(Err(e)),
+			// }
+		})
 	}
 }
