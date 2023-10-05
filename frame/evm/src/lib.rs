@@ -83,7 +83,7 @@ use sp_runtime::{
 	},
 	AccountId32, DispatchErrorWithPostInfo,
 };
-use sp_std::{cmp::min, vec::Vec};
+use sp_std::{cmp::min, vec::Vec, vec};
 
 pub use evm::{
 	Config as EvmConfig, Context, ExitError, ExitFatal, ExitReason, ExitRevert, ExitSucceed,
