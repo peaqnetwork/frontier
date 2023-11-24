@@ -27,8 +27,6 @@ mod mock;
 mod tests;
 
 use alloc::format;
-use scale_codec::{Decode, DecodeLimit};
-use sp_runtime::traits::Dispatchable;
 use core::marker::PhantomData;
 use fp_evm::{
 	ExitError, ExitSucceed, Precompile, PrecompileFailure, PrecompileHandle, PrecompileOutput,
@@ -39,6 +37,8 @@ use frame_support::{
 	traits::{ConstU32, Get},
 };
 use pallet_evm::{AddressMapping, GasWeightMapping};
+use scale_codec::{Decode, DecodeLimit};
+use sp_runtime::traits::Dispatchable;
 
 // `DecodeLimit` specifies the max depth a call can use when decoding, as unbounded depth
 // can be used to overflow the stack.

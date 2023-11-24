@@ -115,11 +115,10 @@ pub trait EthCompatRuntimeApiCollection:
 {
 }
 
-impl<Api> EthCompatRuntimeApiCollection for Api
-where
+impl<Api> EthCompatRuntimeApiCollection for Api where
 	Api: sp_api::ApiExt<Block>
 		+ fp_rpc::ConvertTransactionRuntimeApi<Block>
-		+ fp_rpc::EthereumRuntimeRPCApi<Block>,
+		+ fp_rpc::EthereumRuntimeRPCApi<Block>
 {
 }
 
@@ -141,8 +140,7 @@ pub async fn spawn_frontier_tasks<RuntimeApi, Executor>(
 ) where
 	RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>>,
 	RuntimeApi: Send + Sync + 'static,
-	RuntimeApi::RuntimeApi:
-		EthCompatRuntimeApiCollection,
+	RuntimeApi::RuntimeApi: EthCompatRuntimeApiCollection,
 	Executor: NativeExecutionDispatch + 'static,
 {
 	// Spawn main mapping sync worker background task.

@@ -68,8 +68,7 @@ pub fn new_partial<RuntimeApi, Executor, BIQ>(
 where
 	RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>>,
 	RuntimeApi: Send + Sync + 'static,
-	RuntimeApi::RuntimeApi: BaseRuntimeApiCollection
-		+ EthCompatRuntimeApiCollection,
+	RuntimeApi::RuntimeApi: BaseRuntimeApiCollection + EthCompatRuntimeApiCollection,
 	Executor: NativeExecutionDispatch + 'static,
 	BIQ: FnOnce(
 		Arc<FullClient<RuntimeApi, Executor>>,
@@ -78,13 +77,7 @@ where
 		&TaskManager,
 		Option<TelemetryHandle>,
 		GrandpaBlockImport<FullClient<RuntimeApi, Executor>>,
-	) -> Result<
-		(
-			BasicImportQueue,
-			BoxBlockImport,
-		),
-		ServiceError,
-	>,
+	) -> Result<(BasicImportQueue, BoxBlockImport), ServiceError>,
 {
 	let telemetry = config
 		.telemetry_endpoints
@@ -196,18 +189,11 @@ pub fn build_aura_grandpa_import_queue<RuntimeApi, Executor>(
 	task_manager: &TaskManager,
 	telemetry: Option<TelemetryHandle>,
 	grandpa_block_import: GrandpaBlockImport<FullClient<RuntimeApi, Executor>>,
-) -> Result<
-	(
-		BasicImportQueue,
-		BoxBlockImport,
-	),
-	ServiceError,
->
+) -> Result<(BasicImportQueue, BoxBlockImport), ServiceError>
 where
 	RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>>,
 	RuntimeApi: Send + Sync + 'static,
-	RuntimeApi::RuntimeApi:
-		RuntimeApiCollection,
+	RuntimeApi::RuntimeApi: RuntimeApiCollection,
 	Executor: NativeExecutionDispatch + 'static,
 {
 	let frontier_block_import =
@@ -252,18 +238,11 @@ pub fn build_manual_seal_import_queue<RuntimeApi, Executor>(
 	task_manager: &TaskManager,
 	_telemetry: Option<TelemetryHandle>,
 	_grandpa_block_import: GrandpaBlockImport<FullClient<RuntimeApi, Executor>>,
-) -> Result<
-	(
-		BasicImportQueue,
-		BoxBlockImport,
-	),
-	ServiceError,
->
+) -> Result<(BasicImportQueue, BoxBlockImport), ServiceError>
 where
 	RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>>,
 	RuntimeApi: Send + Sync + 'static,
-	RuntimeApi::RuntimeApi:
-		RuntimeApiCollection,
+	RuntimeApi::RuntimeApi: RuntimeApiCollection,
 	Executor: NativeExecutionDispatch + 'static,
 {
 	let frontier_block_import = FrontierBlockImport::new(client.clone(), client);
@@ -286,8 +265,7 @@ pub async fn new_full<RuntimeApi, Executor>(
 where
 	RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>>,
 	RuntimeApi: Send + Sync + 'static,
-	RuntimeApi::RuntimeApi:
-		RuntimeApiCollection,
+	RuntimeApi::RuntimeApi: RuntimeApiCollection,
 	Executor: NativeExecutionDispatch + 'static,
 {
 	let build_import_queue = if sealing.is_some() {
@@ -631,8 +609,7 @@ fn run_manual_seal_authorship<RuntimeApi, Executor>(
 where
 	RuntimeApi: ConstructRuntimeApi<Block, FullClient<RuntimeApi, Executor>>,
 	RuntimeApi: Send + Sync + 'static,
-	RuntimeApi::RuntimeApi:
-		RuntimeApiCollection,
+	RuntimeApi::RuntimeApi: RuntimeApiCollection,
 	Executor: NativeExecutionDispatch + 'static,
 {
 	let proposer_factory = sc_basic_authorship::ProposerFactory::new(

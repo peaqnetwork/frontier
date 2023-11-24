@@ -25,7 +25,10 @@ use scale_codec::{Decode, Encode};
 use scale_info::TypeInfo;
 // Substrate
 use sp_core::{H160, H256, U256};
-use sp_runtime::{traits::{Block as BlockT, HashingFor}, Permill, RuntimeDebug};
+use sp_runtime::{
+	traits::{Block as BlockT, HashingFor},
+	Permill, RuntimeDebug,
+};
 use sp_state_machine::OverlayedChanges;
 use sp_std::vec::Vec;
 
