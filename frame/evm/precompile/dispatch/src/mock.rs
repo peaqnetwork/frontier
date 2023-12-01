@@ -156,6 +156,7 @@ impl pallet_evm::Config for Test {
 	type FindAuthor = FindAuthorTruncated;
 	type SuicideQuickClearLimit = SuicideQuickClearLimit;
 	type GasLimitPovSizeRatio = ();
+	type GasLimitStorageGrowthRatio = ();
 	type Timestamp = Timestamp;
 	type WeightInfo = ();
 }
