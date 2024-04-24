@@ -93,7 +93,6 @@ mod old_types {
 
 	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
 	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-	#[cfg_attr(feature = "std", serde(untagged))]
 	pub enum DispatchErrorLegacy {
 		/// Some error occurred.
 		Other(
@@ -131,6 +130,7 @@ mod old_types {
 	/// Reason why a dispatch call failed.
 	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
 	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+	#[cfg_attr(feature = "std", serde(untagged))]
 	pub enum DispatchError {
 		V1(DispatchErrorLegacy),
 		V2(sp_runtime::DispatchError),
