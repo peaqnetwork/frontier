@@ -55,13 +55,10 @@ pub const JSON_RPC_ERROR_DEFAULT: i32 = -32000;
 /// The changes contained in https://github.com/paritytech/substrate/pull/10776 changed the
 /// serde encoding for variant `DispatchError::Module`.
 mod old_types {
-	use scale_codec::{Decode, Encode};
-	#[cfg(feature = "std")]
-	pub use serde::{de::DeserializeOwned, Deserialize, Serialize};
+	use scale_codec::Decode;
 
 	/// Description of what went wrong when trying to complete an operation on a token.
-	#[derive(Eq, PartialEq, Clone, Copy, Encode, Decode, Debug)]
-	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+	#[derive(Eq, PartialEq, Clone, Copy, Decode, Debug)]
 	pub enum TokenError {
 		/// Funds are unavailable.
 		NoFunds,
@@ -80,8 +77,7 @@ mod old_types {
 	}
 
 	/// Arithmetic errors.
-	#[derive(Eq, PartialEq, Clone, Copy, Encode, Decode, Debug)]
-	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+	#[derive(Eq, PartialEq, Clone, Copy, Decode, Debug)]
 	pub enum ArithmeticError {
 		/// Underflow.
 		Underflow,
@@ -91,9 +87,41 @@ mod old_types {
 		DivisionByZero,
 	}
 
-	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
-	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-	pub enum DispatchErrorLegacy {
+	#[derive(PartialEq, Eq, Clone, Copy, Decode, Debug)]
+	pub enum DispatchErrorV1 {
+		/// Some error occurred.
+		Other(
+			#[codec(skip)]
+			#[cfg_attr(feature = "std", serde(skip_deserializing))]
+			&'static str,
+		),
+		/// Failed to lookup some data.
+		CannotLookup,
+		/// A bad origin.
+		BadOrigin,
+		/// A custom error in a module.
+		Module {
+			/// Module index, matching the metadata module index.
+			index: u8,
+			/// Module specific error value.
+			error: u8,
+			/// Optional error message.
+			#[codec(skip)]
+			#[cfg_attr(feature = "std", serde(skip_deserializing))]
+			message: Option<&'static str>,
+		},
+		/// At least one consumer is remaining so the account cannot be destroyed.
+		ConsumerRemaining,
+		/// There are no providers so the account cannot be created.
+		NoProviders,
+		/// An error to do with tokens.
+		Token(TokenError),
+		/// An arithmetic error.
+		Arithmetic(ArithmeticError),
+	}
+
+	#[derive(PartialEq, Eq, Clone, Copy, Decode, Debug)]
+	pub enum DispatchErrorV2 {
 		/// Some error occurred.
 		Other(
 			#[codec(skip)]
@@ -128,12 +156,23 @@ mod old_types {
 	}
 
 	/// Reason why a dispatch call failed.
-	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
-	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-	#[cfg_attr(feature = "std", serde(untagged))]
+	#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 	pub enum DispatchError {
-		V1(DispatchErrorLegacy),
-		V2(sp_runtime::DispatchError),
+		V1(DispatchErrorV1),
+		V2(DispatchErrorV2),
+	}
+
+	impl Decode for DispatchError {
+		fn decode<I: scale_codec::Input>(input: &mut I) -> Result<Self, scale_codec::Error> {
+			if let Ok(r) = DispatchErrorV1::decode(input) {
+				return Ok(DispatchError::V1(r));
+			}
+			if let Ok(r) = DispatchErrorV2::decode(input) {
+				return Ok(DispatchError::V2(r));
+			}
+
+			Err("Could not decode DispatchError".into())
+		}
 	}
 }
 
