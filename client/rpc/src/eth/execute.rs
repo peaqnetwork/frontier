@@ -55,10 +55,10 @@ pub const JSON_RPC_ERROR_DEFAULT: i32 = -32000;
 /// The changes contained in https://github.com/paritytech/substrate/pull/10776 changed the
 /// serde encoding for variant `DispatchError::Module`.
 mod old_types {
-	use scale_codec::Decode;
+	use scale_codec::{Decode, Encode};
 
 	/// Description of what went wrong when trying to complete an operation on a token.
-	#[derive(Eq, PartialEq, Clone, Copy, Decode, Debug)]
+	#[derive(Eq, PartialEq, Clone, Copy, Encode, Decode, Debug)]
 	pub enum TokenError {
 		/// Funds are unavailable.
 		NoFunds,
@@ -77,7 +77,7 @@ mod old_types {
 	}
 
 	/// Arithmetic errors.
-	#[derive(Eq, PartialEq, Clone, Copy, Decode, Debug)]
+	#[derive(Eq, PartialEq, Clone, Copy, Encode, Decode, Debug)]
 	pub enum ArithmeticError {
 		/// Underflow.
 		Underflow,
@@ -87,7 +87,7 @@ mod old_types {
 		DivisionByZero,
 	}
 
-	#[derive(PartialEq, Eq, Clone, Copy, Decode, Debug)]
+	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
 	pub enum DispatchErrorV1 {
 		/// Some error occurred.
 		Other(
@@ -120,7 +120,7 @@ mod old_types {
 		Arithmetic(ArithmeticError),
 	}
 
-	#[derive(PartialEq, Eq, Clone, Copy, Decode, Debug)]
+	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
 	pub enum DispatchErrorV2 {
 		/// Some error occurred.
 		Other(
@@ -164,14 +164,17 @@ mod old_types {
 
 	impl Decode for DispatchError {
 		fn decode<I: scale_codec::Input>(input: &mut I) -> Result<Self, scale_codec::Error> {
-			if let Ok(r) = DispatchErrorV1::decode(input) {
+			let remaining = input.remaining_len()?;
+			let mut v = vec![0u8; remaining.unwrap_or(0)];
+			let _ = input.read(&mut v);
+
+			if let Ok(r) = DispatchErrorV1::decode(&mut v.as_slice()) {
 				return Ok(DispatchError::V1(r));
 			}
-			if let Ok(r) = DispatchErrorV2::decode(input) {
-				return Ok(DispatchError::V2(r));
-			}
 
-			Err("Could not decode DispatchError".into())
+			Ok(DispatchError::V2(DispatchErrorV2::decode(
+				&mut v.as_slice(),
+			)?))
 		}
 	}
 }
@@ -1182,5 +1185,33 @@ fn fee_details(
 			max_priority_fee_per_gas: Some(U256::zero()),
 			fee_cap: U256::zero(),
 		}),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::old_types;
+	use scale_codec::{Decode, Encode};
+
+	#[test]
+	fn test_dispatch_error() {
+		let v1 = old_types::DispatchErrorV1::Module {
+			index: 1,
+			error: 1,
+			message: None,
+		};
+		let v2 = old_types::DispatchErrorV2::TooManyConsumers;
+
+		let encoded_v1 = v1.encode();
+		let encoded_v2 = v2.encode();
+
+		assert_eq!(
+			old_types::DispatchError::decode(&mut encoded_v1.as_slice()),
+			Ok(old_types::DispatchError::V1(v1))
+		);
+		assert_eq!(
+			old_types::DispatchError::decode(&mut encoded_v2.as_slice()),
+			Ok(old_types::DispatchError::V2(v2))
+		);
 	}
 }
