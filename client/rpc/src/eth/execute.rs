@@ -50,6 +50,93 @@ use crate::{
 /// Default JSONRPC error code return by geth
 pub const JSON_RPC_ERROR_DEFAULT: i32 = -32000;
 
+/// The types contained in this module are required for backwards compatility when decoding
+/// results produced by old versions of substrate.
+/// The changes contained in https://github.com/paritytech/substrate/pull/10776 changed the
+/// serde encoding for variant `DispatchError::Module`.
+mod old_types {
+	use scale_codec::{Decode, Encode};
+	#[cfg(feature = "std")]
+	pub use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+	/// Description of what went wrong when trying to complete an operation on a token.
+	#[derive(Eq, PartialEq, Clone, Copy, Encode, Decode, Debug)]
+	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+	pub enum TokenError {
+		/// Funds are unavailable.
+		NoFunds,
+		/// Account that must exist would die.
+		WouldDie,
+		/// Account cannot exist with the funds that would be given.
+		BelowMinimum,
+		/// Account cannot be created.
+		CannotCreate,
+		/// The asset in question is unknown.
+		UnknownAsset,
+		/// Funds exist but are frozen.
+		Frozen,
+		/// Operation is not supported by the asset.
+		Unsupported,
+	}
+
+	/// Arithmetic errors.
+	#[derive(Eq, PartialEq, Clone, Copy, Encode, Decode, Debug)]
+	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+	pub enum ArithmeticError {
+		/// Underflow.
+		Underflow,
+		/// Overflow.
+		Overflow,
+		/// Division by zero.
+		DivisionByZero,
+	}
+
+	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
+	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+	#[cfg_attr(feature = "std", serde(untagged))]
+	pub enum DispatchErrorLegacy {
+		/// Some error occurred.
+		Other(
+			#[codec(skip)]
+			#[cfg_attr(feature = "std", serde(skip_deserializing))]
+			&'static str,
+		),
+		/// Failed to lookup some data.
+		CannotLookup,
+		/// A bad origin.
+		BadOrigin,
+		/// A custom error in a module.
+		Module {
+			/// Module index, matching the metadata module index.
+			index: u8,
+			/// Module specific error value.
+			error: u8,
+			/// Optional error message.
+			#[codec(skip)]
+			#[cfg_attr(feature = "std", serde(skip_deserializing))]
+			message: Option<&'static str>,
+		},
+		/// At least one consumer is remaining so the account cannot be destroyed.
+		ConsumerRemaining,
+		/// There are no providers so the account cannot be created.
+		NoProviders,
+		/// There are too many consumers so the account cannot be created.
+		TooManyConsumers,
+		/// An error to do with tokens.
+		Token(TokenError),
+		/// An arithmetic error.
+		Arithmetic(ArithmeticError),
+	}
+
+	/// Reason why a dispatch call failed.
+	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
+	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
+	pub enum DispatchError {
+		V1(DispatchErrorLegacy),
+		V2(sp_runtime::DispatchError),
+	}
+}
+
 /// Allow to adapt a request for `estimate_gas`.
 /// Can be used to estimate gas of some contracts using a different function
 /// in the case the normal gas estimation doesn't work.
@@ -104,7 +191,11 @@ where
 			(
 				details.gas_price,
 				// Old runtimes require max_fee_per_gas to be None for non transactional calls.
-				if details.max_fee_per_gas == Some(U256::zero()) { None } else { details.max_fee_per_gas },
+				if details.max_fee_per_gas == Some(U256::zero()) {
+					None
+				} else {
+					details.max_fee_per_gas
+				},
 				details.max_priority_fee_per_gas,
 			)
 		};
@@ -259,7 +350,7 @@ where
 							.call_api_at(params)
 							.and_then(|r| {
 								Result::map_err(
-									<Result<ExecutionInfo::<Vec<u8>>, DispatchError> as Decode>::decode(&mut &r[..]),
+									<Result<ExecutionInfo::<Vec<u8>>, old_types::DispatchError> as Decode>::decode(&mut &r[..]),
 									|error| sp_api::ApiError::FailedToDecodeReturnValue {
 										function: "EthereumRuntimeRPCApi_call",
 										error,
