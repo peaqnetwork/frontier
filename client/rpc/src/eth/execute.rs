@@ -53,7 +53,7 @@ pub const JSON_RPC_ERROR_DEFAULT: i32 = -32000;
 /// The types contained in this module are required for backwards compatility when decoding
 /// results produced by old versions of substrate.
 /// The changes contained in https://github.com/paritytech/substrate/pull/10776 changed the
-/// serde encoding for variant `DispatchError::Module`.
+/// scale encoding for variant `DispatchError::Module`.
 mod old_types {
 	use scale_codec::{Decode, Encode};
 
@@ -90,11 +90,7 @@ mod old_types {
 	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
 	pub enum DispatchErrorV1 {
 		/// Some error occurred.
-		Other(
-			#[codec(skip)]
-			#[cfg_attr(feature = "std", serde(skip_deserializing))]
-			&'static str,
-		),
+		Other(#[codec(skip)] &'static str),
 		/// Failed to lookup some data.
 		CannotLookup,
 		/// A bad origin.
@@ -107,7 +103,6 @@ mod old_types {
 			error: u8,
 			/// Optional error message.
 			#[codec(skip)]
-			#[cfg_attr(feature = "std", serde(skip_deserializing))]
 			message: Option<&'static str>,
 		},
 		/// At least one consumer is remaining so the account cannot be destroyed.
@@ -123,11 +118,7 @@ mod old_types {
 	#[derive(PartialEq, Eq, Clone, Copy, Encode, Decode, Debug)]
 	pub enum DispatchErrorV2 {
 		/// Some error occurred.
-		Other(
-			#[codec(skip)]
-			#[cfg_attr(feature = "std", serde(skip_deserializing))]
-			&'static str,
-		),
+		Other(#[codec(skip)] &'static str),
 		/// Failed to lookup some data.
 		CannotLookup,
 		/// A bad origin.
@@ -140,7 +131,6 @@ mod old_types {
 			error: u8,
 			/// Optional error message.
 			#[codec(skip)]
-			#[cfg_attr(feature = "std", serde(skip_deserializing))]
 			message: Option<&'static str>,
 		},
 		/// At least one consumer is remaining so the account cannot be destroyed.
@@ -157,22 +147,22 @@ mod old_types {
 
 	/// Reason why a dispatch call failed.
 	#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-	pub enum DispatchError {
+	pub enum OldDispatchError {
 		V1(DispatchErrorV1),
 		V2(DispatchErrorV2),
 	}
 
-	impl Decode for DispatchError {
+	impl Decode for OldDispatchError {
 		fn decode<I: scale_codec::Input>(input: &mut I) -> Result<Self, scale_codec::Error> {
 			let remaining = input.remaining_len()?;
 			let mut v = vec![0u8; remaining.unwrap_or(0)];
 			let _ = input.read(&mut v);
 
 			if let Ok(r) = DispatchErrorV1::decode(&mut v.as_slice()) {
-				return Ok(DispatchError::V1(r));
+				return Ok(OldDispatchError::V1(r));
 			}
 
-			Ok(DispatchError::V2(DispatchErrorV2::decode(
+			Ok(OldDispatchError::V2(DispatchErrorV2::decode(
 				&mut v.as_slice(),
 			)?))
 		}
@@ -392,7 +382,7 @@ where
 							.call_api_at(params)
 							.and_then(|r| {
 								Result::map_err(
-									<Result<ExecutionInfo::<Vec<u8>>, old_types::DispatchError> as Decode>::decode(&mut &r[..]),
+									<Result<ExecutionInfo::<Vec<u8>>, old_types::OldDispatchError> as Decode>::decode(&mut &r[..]),
 									|error| sp_api::ApiError::FailedToDecodeReturnValue {
 										function: "EthereumRuntimeRPCApi_call",
 										error,
@@ -1190,28 +1180,28 @@ fn fee_details(
 
 #[cfg(test)]
 mod tests {
-	use super::old_types;
+	use super::old_types::*;
 	use scale_codec::{Decode, Encode};
 
 	#[test]
 	fn test_dispatch_error() {
-		let v1 = old_types::DispatchErrorV1::Module {
+		let v1 = DispatchErrorV1::Module {
 			index: 1,
 			error: 1,
 			message: None,
 		};
-		let v2 = old_types::DispatchErrorV2::TooManyConsumers;
+		let v2 = DispatchErrorV2::TooManyConsumers;
 
 		let encoded_v1 = v1.encode();
 		let encoded_v2 = v2.encode();
 
 		assert_eq!(
-			old_types::DispatchError::decode(&mut encoded_v1.as_slice()),
-			Ok(old_types::DispatchError::V1(v1))
+			OldDispatchError::decode(&mut encoded_v1.as_slice()),
+			Ok(OldDispatchError::V1(v1))
 		);
 		assert_eq!(
-			old_types::DispatchError::decode(&mut encoded_v2.as_slice()),
-			Ok(old_types::DispatchError::V2(v2))
+			OldDispatchError::decode(&mut encoded_v2.as_slice()),
+			Ok(OldDispatchError::V2(v2))
 		);
 	}
 }
