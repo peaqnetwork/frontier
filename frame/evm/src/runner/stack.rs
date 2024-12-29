@@ -1372,6 +1372,7 @@ where
 mod tests {
 	use super::*;
 	use crate::mock::{MockPrecompileSet, Test};
+	use crate::tests::new_test_ext;
 	use evm::ExitSucceed;
 
 	macro_rules! assert_matches {
@@ -1393,6 +1394,7 @@ mod tests {
 
 	#[test]
 	fn test_evm_reentrancy() {
+		new_test_ext().execute_with(|| {
 		let config = evm::Config::istanbul();
 
 		// Should fail with the appropriate error if there is reentrancy
@@ -1457,5 +1459,6 @@ mod tests {
 			|_| (ExitReason::Succeed(ExitSucceed::Stopped), ()),
 		);
 		assert!(res.is_ok());
+	});
 	}
 }
