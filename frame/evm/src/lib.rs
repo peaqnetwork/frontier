@@ -1044,8 +1044,13 @@ where
 	fn pay_priority_fee(tip: Self::LiquidityInfo) {
 		// Default Ethereum behaviour: issue the tip to the block author.
 		if let Some(tip) = tip {
+			log::error!("show me the author: {:?}", <Pallet<T>>::find_author());
 			let account_id = T::AddressMapping::into_account_id(<Pallet<T>>::find_author());
-			let _ = C::deposit_into_existing(&account_id, tip.peek());
+			log::error!("show me the account_id: {:?} and the tip: {:?}", account_id, tip.peek());
+			let out = C::deposit_into_existing(&account_id, tip.peek());
+            log::error!("show me the out: {}", out.is_ok());
+		} else {
+			log::error!("no tip to pay");
 		}
 	}
 }
