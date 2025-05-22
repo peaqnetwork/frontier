@@ -19,7 +19,7 @@ use frame_support::{
 	dispatch::{DispatchInfo, GetDispatchInfo},
 	traits::{ExtrinsicCall, InherentBuilder, SignedTransactionBuilder},
 };
-use scale_codec::{Decode, Encode};
+use scale_codec::{Decode, Encode, DecodeWithMemTracking};
 use scale_info::TypeInfo;
 use sp_runtime::{
 	generic::{self, Preamble},
@@ -35,7 +35,7 @@ use crate::{CheckedExtrinsic, CheckedSignature, SelfContainedCall};
 
 /// A extrinsic right from the external world. This is unchecked and so
 /// can contain a signature.
-#[derive(PartialEq, Eq, Clone, Encode, Decode, RuntimeDebug, TypeInfo)]
+#[derive(PartialEq, Eq, Clone, Encode, Decode, RuntimeDebug, TypeInfo, DecodeWithMemTracking)]
 pub struct UncheckedExtrinsic<Address, Call, Signature, Extension>(
 	pub generic::UncheckedExtrinsic<Address, Call, Signature, Extension>,
 );

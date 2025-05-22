@@ -201,7 +201,7 @@ pub fn new_test_ext(accounts_len: usize) -> (Vec<AccountInfo>, sp_io::TestExtern
 		.map(|i| (pairs[i].account_id.clone(), 10_000_000))
 		.collect();
 
-	pallet_balances::GenesisConfig::<Test> { balances }
+	pallet_balances::GenesisConfig::<Test> { balances, ..Default::default() }
 		.assimilate_storage(&mut ext)
 		.unwrap();
 
@@ -226,7 +226,7 @@ pub fn new_test_ext_with_initial_balance(
 		.map(|i| (pairs[i].account_id.clone(), initial_balance))
 		.collect();
 
-	pallet_balances::GenesisConfig::<Test> { balances }
+	pallet_balances::GenesisConfig::<Test> { balances, ..Default::default() }
 		.assimilate_storage(&mut ext)
 		.unwrap();
 

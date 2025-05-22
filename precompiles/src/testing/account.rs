@@ -20,10 +20,11 @@ use pallet_evm::AddressMapping;
 use scale_info::TypeInfo;
 use serde::{Deserialize, Serialize};
 use sp_core::{keccak_256, Decode, Encode, MaxEncodedLen, H160, H256};
+use scale_codec::DecodeWithMemTracking;
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
 #[derive(Serialize, Deserialize, derive_more::Display)]
-#[derive(Encode, Decode, MaxEncodedLen, TypeInfo)]
+#[derive(Encode, Decode, MaxEncodedLen, TypeInfo, DecodeWithMemTracking)]
 pub struct MockAccount(pub H160);
 
 impl MockAccount {
