@@ -298,6 +298,50 @@ fn detect_version_without_version_file_rocksdb<Block: BlockT, C: HeaderBackend<B
 	}
 }
 
+#[cfg(feature = "rocksdb")]
+fn ensure_rocksdb_has_v3_columns(db_path: &Path) -> UpgradeResult<()> {
+	// Opening with V3_NUM_COLUMNS does not add the missing column to an existing DB.
+	// kvdb-rocksdb never sets `create_missing_column_families`, so RocksDB refuses the
+	// open, and kvdb-rocksdb's fallback retries with an empty column family list --
+	// which only works for a DB that has none yet. On a v2 DB that fallback fails with
+	// "Column families not opened: col3, col2, col1, col0" and the node exits on start.
+	// Add the column explicitly first, the same way the paritydb path does.
+	//
+	// The two probes below only try the exact v2 and v3 column counts, which is safe
+	// because the gap is exactly one column. Reusing this shape for a future bump that
+	// adds two or more columns would need an incremental probe instead: a crash between
+	// two `add_column` calls would leave the db matching neither endpoint, and rocksdb
+	// refuses any open that does not list every column family already on disk.
+	match kvdb_rocksdb::Database::open(
+		&kvdb_rocksdb::DatabaseConfig::with_columns(V3_NUM_COLUMNS),
+		db_path,
+	) {
+		// Already has the v3 column layout.
+		Ok(_) => return Ok(()),
+		// Keep the first error: if the real cause is a held lock, bad permissions or
+		// corruption rather than a missing column, the reopen below fails too and its
+		// "before add_column" message alone would point at the wrong thing.
+		Err(err) => log::debug!(
+			target: "fc-db-upgrade",
+			"rocksdb v3 probe failed, assuming the v3 column is missing: {err}",
+		),
+	}
+
+	let mut db = kvdb_rocksdb::Database::open(
+		&kvdb_rocksdb::DatabaseConfig::with_columns(V2_NUM_COLUMNS),
+		db_path,
+	)
+	.map_err(|err| io::Error::other(format!("Failed to open rocksdb before add_column: {err}")))?;
+
+	for _ in V2_NUM_COLUMNS..V3_NUM_COLUMNS {
+		db.add_column().map_err(|err| {
+			io::Error::other(format!("Failed to add rocksdb column (v2->v3): {err}"))
+		})?;
+	}
+
+	Ok(())
+}
+
 fn ensure_paritydb_has_v3_columns(db_path: &Path) -> UpgradeResult<()> {
 	let mut opts_v3 = parity_db::Options::with_columns(db_path, V3_NUM_COLUMNS as u8);
 	opts_v3.columns[super::columns::BLOCK_MAPPING as usize].btree_index = true;
@@ -529,6 +573,7 @@ pub(crate) fn migrate_2_to_3_rocks_db<Block: BlockT, C: HeaderBackend<Block>>(
 	db_path: &Path,
 ) -> UpgradeResult<UpgradeVersion2To3Summary> {
 	log::info!("🔨 Running Frontier DB migration from version 2 to version 3. Please wait.");
+	ensure_rocksdb_has_v3_columns(db_path)?;
 	let mut res = UpgradeVersion2To3Summary {
 		success: 0,
 		skipped: 0,
@@ -815,6 +860,134 @@ mod tests {
 		assert_eq!(decoded_eth, eth_hash);
 
 		// Version file updated to current.
+		assert_eq!(super::current_version(&db_path).expect("version"), 3u32);
+	}
+
+	#[cfg(feature = "rocksdb")]
+	#[test]
+	fn upgrade_2_to_3_rocksdb_adds_missing_column_then_backfills() {
+		let tmp = tempdir().expect("create a temporary directory");
+		let db_path = tmp.path().to_owned();
+
+		let (client, _) = TestClientBuilder::new()
+			.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+			None,
+		);
+		let client = Arc::new(client);
+
+		// Build/import one block so we have a known block hash -> block number mapping.
+		let chain_info = client.chain_info();
+		let mut builder = BlockBuilderBuilder::new(&*client)
+			.on_parent_block(chain_info.best_hash)
+			.with_parent_block_number(chain_info.best_number)
+			.build()
+			.expect("build block");
+		builder
+			.push_storage_change(vec![1], None)
+			.expect("push storage change");
+		let block = builder.build().expect("build").block;
+		let substrate_hash = block.header.hash();
+		let block_number_u64: u64 = *block.header.number();
+		executor::block_on(client.import(BlockOrigin::Own, block)).expect("import block");
+
+		// Create an "old" RocksDB (v2) with 4 columns and a v2-style BLOCK_MAPPING entry.
+		let eth_hash = H256::random();
+		{
+			let db = kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V2_NUM_COLUMNS),
+				&db_path,
+			)
+			.expect("open/create v2 rocksdb");
+			let mut transaction = db.transaction();
+			transaction.put_vec(
+				crate::kv::columns::BLOCK_MAPPING,
+				&eth_hash.encode(),
+				vec![substrate_hash].encode(), // v2 encoding: Vec<Block::Hash>
+			);
+			db.write(transaction).expect("commit v2 block mapping");
+		} // DB closed here
+
+		// Sanity check: opening with v3 columns must fail on a 4-column db. `Database::open`
+		// cannot add a column family to an existing rocksdb -- that is the bug this guards.
+		assert!(
+			kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+				&db_path,
+			)
+			.is_err(),
+			"expected v3 open to fail on a 4-column rocksdb"
+		);
+
+		// Write version file to indicate v2.
+		let mut version_file = std::fs::File::create(super::version_file_path(&db_path))
+			.expect("db version file created");
+		version_file.write_all(b"2").expect("write version 2");
+
+		// Run upgrade: should add the new column and backfill block_number -> eth_hash mapping.
+		let source = sc_client_db::DatabaseSource::RocksDb {
+			path: db_path.clone(),
+			cache_size: 0,
+		};
+		let client_for_rerun = client.clone();
+		super::upgrade_db::<OpaqueBlock, _>(client, &db_path, &source).expect("upgrade v2->v3");
+
+		// Verify the DB can now open with v3 column count and contains the backfilled mapping.
+		let db = kvdb_rocksdb::Database::open(
+			&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+			&db_path,
+		)
+		.expect("open v3 rocksdb");
+
+		// Old mapping is still present.
+		let raw = db
+			.get(crate::kv::columns::BLOCK_MAPPING, &eth_hash.encode())
+			.expect("get block mapping")
+			.expect("block mapping exists");
+		let decoded: Vec<<OpaqueBlock as BlockT>::Hash> =
+			Vec::decode(&mut &raw[..]).expect("decode Vec<Block::Hash>");
+		assert_eq!(decoded, vec![substrate_hash]);
+
+		// New index is backfilled.
+		let raw = db
+			.get(
+				crate::kv::columns::BLOCK_NUMBER_MAPPING,
+				&block_number_u64.encode(),
+			)
+			.expect("get block number mapping")
+			.expect("block number mapping exists");
+		let decoded_eth = H256::decode(&mut &raw[..]).expect("decode H256");
+		assert_eq!(decoded_eth, eth_hash);
+
+		// Version file updated to current.
+		assert_eq!(super::current_version(&db_path).expect("version"), 3u32);
+
+		// The migration must be re-runnable: the version file is only written after a
+		// full pass, so an interrupted run restarts from the beginning against a db that
+		// already has the extra column. Simulate that by resetting the version to 2.
+		drop(db);
+		let mut version_file = std::fs::File::create(super::version_file_path(&db_path))
+			.expect("db version file re-created");
+		version_file.write_all(b"2").expect("write version 2 again");
+		super::upgrade_db::<OpaqueBlock, _>(client_for_rerun, &db_path, &source)
+			.expect("re-running the v2->v3 upgrade must succeed");
+
+		let db = kvdb_rocksdb::Database::open(
+			&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+			&db_path,
+		)
+		.expect("open v3 rocksdb after rerun");
+		let raw = db
+			.get(
+				crate::kv::columns::BLOCK_NUMBER_MAPPING,
+				&block_number_u64.encode(),
+			)
+			.expect("get block number mapping after rerun")
+			.expect("block number mapping still exists after rerun");
+		assert_eq!(
+			H256::decode(&mut &raw[..]).expect("decode H256"),
+			eth_hash,
+			"rerun must leave the backfilled mapping intact"
+		);
 		assert_eq!(super::current_version(&db_path).expect("version"), 3u32);
 	}
 
