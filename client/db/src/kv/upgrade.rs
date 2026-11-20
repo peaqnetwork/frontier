@@ -115,6 +115,13 @@ pub(crate) fn upgrade_db<Block: BlockT, C: HeaderBackend<Block>>(
 		return Err(UpgradeError::UnsupportedVersion(db_version));
 	}
 
+	// Both rocksdb migrations below open the DB with V3_NUM_COLUMNS, and a v1 DB has the
+	// same 4 columns as a v2 one, so add the missing column before either of them runs.
+	#[cfg(feature = "rocksdb")]
+	if db_version < 3 && matches!(source, DatabaseSource::RocksDb { .. }) {
+		ensure_rocksdb_has_v3_columns(db_path)?;
+	}
+
 	// Version 1 -> 2: Migrate block mapping from One-to-one to One-to-many
 	if db_version == 1 {
 		let summary: UpgradeVersion1To2Summary = match source {
@@ -285,6 +292,49 @@ fn detect_version_without_version_file_rocksdb<Block: BlockT, C: HeaderBackend<B
 	_client: Arc<C>,
 	db_path: &Path,
 ) -> UpgradeResult<u32> {
+	// If a v3 DB exists already, opening with 4 columns will fail. Try v3 first.
+	// This cannot report a v1/v2 (4-column) DB as v3: kvdb-rocksdb never sets
+	// `create_missing_column_families`, so RocksDB refuses to open a 4-column DB with
+	// 5 columns rather than creating the missing one.
+	match kvdb_rocksdb::Database::open(
+		&kvdb_rocksdb::DatabaseConfig::with_columns(V3_NUM_COLUMNS),
+		db_path,
+	) {
+		Ok(db) => {
+			// 5 columns do not prove the data was migrated: block mappings with an empty
+			// BLOCK_NUMBER_MAPPING may be v1/v2 data, so detect them as on a 4-column db
+			// and let `upgrade_db` rerun the migration(s) and the 2->3 backfill. A genuine
+			// v3 db can be in this state too (the backfill skips hashes the client does
+			// not know); rerunning the backfill on it leaves BLOCK_MAPPING as it is and
+			// only writes BLOCK_NUMBER_MAPPING, and the version file is then written as 3.
+			// Like the 2->3 backfill on any v2 db, it may map a number to a non-canonical
+			// block's hash; every lookup that returns a block checks the hash against the
+			// canonical chain, and the canonical reconciler (or the canonical block's own
+			// sync) replaces it.
+			// A read error is returned rather than taken as an empty column, so a db that
+			// cannot be read is not given a version.
+			let number_mapping_is_empty = db
+				.iter(super::columns::BLOCK_NUMBER_MAPPING)
+				.next()
+				.transpose()?
+				.is_none();
+			if number_mapping_is_empty {
+				let mut iter = db.iter(super::columns::BLOCK_MAPPING);
+				if let Some((_k, v)) = iter.next().transpose()? {
+					return Ok(block_mapping_version::<Block>(&v));
+				}
+			}
+			return Ok(3);
+		}
+		// Keep the probe's error: if the real cause is a held lock, bad permissions or
+		// corruption rather than the column count, the v2 open below fails too and its
+		// message alone would point at the wrong thing.
+		Err(err) => log::debug!(
+			target: "fc-db-upgrade",
+			"rocksdb v3 probe failed, trying the v2 column layout: {err}",
+		),
+	}
+
 	let db_cfg = kvdb_rocksdb::DatabaseConfig::with_columns(V2_NUM_COLUMNS);
 	let db = kvdb_rocksdb::Database::open(&db_cfg, db_path)?;
 	let mut iter = db.iter(super::columns::BLOCK_MAPPING);
@@ -292,9 +342,15 @@ fn detect_version_without_version_file_rocksdb<Block: BlockT, C: HeaderBackend<B
 		return Ok(2);
 	};
 
-	match Vec::<Block::Hash>::decode(&mut &v[..]) {
-		Ok(vec) if !vec.is_empty() => Ok(2),
-		_ => Ok(1),
+	Ok(block_mapping_version::<Block>(&v))
+}
+
+/// v2 and v3 encode a BLOCK_MAPPING value as `Vec<Block::Hash>`, v1 as `Block::Hash`.
+#[cfg(feature = "rocksdb")]
+fn block_mapping_version<Block: BlockT>(value: &[u8]) -> u32 {
+	match Vec::<Block::Hash>::decode(&mut &value[..]) {
+		Ok(vec) if !vec.is_empty() => 2,
+		_ => 1,
 	}
 }
 
@@ -303,8 +359,9 @@ fn ensure_rocksdb_has_v3_columns(db_path: &Path) -> UpgradeResult<()> {
 	// Opening with V3_NUM_COLUMNS does not add the missing column to an existing DB.
 	// kvdb-rocksdb never sets `create_missing_column_families`, so RocksDB refuses the
 	// open, and kvdb-rocksdb's fallback retries with an empty column family list --
-	// which only works for a DB that has none yet. On a v2 DB that fallback fails with
-	// "Column families not opened: col3, col2, col1, col0" and the node exits on start.
+	// which only works for a DB that has none yet. On a v1 or v2 DB (both have the same
+	// 4 columns) that fallback fails with "Column families not opened: col3, col2, col1,
+	// col0" and the node exits on start.
 	// Add the column explicitly first, the same way the paritydb path does.
 	//
 	// The two probes below only try the exact v2 and v3 column counts, which is safe
@@ -335,7 +392,7 @@ fn ensure_rocksdb_has_v3_columns(db_path: &Path) -> UpgradeResult<()> {
 
 	for _ in V2_NUM_COLUMNS..V3_NUM_COLUMNS {
 		db.add_column().map_err(|err| {
-			io::Error::other(format!("Failed to add rocksdb column (v2->v3): {err}"))
+			io::Error::other(format!("Failed to add rocksdb column (v1/v2->v3): {err}"))
 		})?;
 	}
 
@@ -433,8 +490,8 @@ pub(crate) fn migrate_1_to_2_rocks_db<Block: BlockT, C: HeaderBackend<Block>>(
 		Ok(())
 	};
 
-	// Open with V3_NUM_COLUMNS to handle both v1 DBs (will create missing columns)
-	// and test DBs that were created with 5 columns.
+	// Open with V3_NUM_COLUMNS: `upgrade_db` has already added the v3 column, since
+	// opening with more columns than the DB has does not create the missing one.
 	let db_cfg = kvdb_rocksdb::DatabaseConfig::with_columns(V3_NUM_COLUMNS);
 	let db = kvdb_rocksdb::Database::open(&db_cfg, db_path)?;
 
@@ -1239,6 +1296,571 @@ mod tests {
 			// Upgrade db version file
 			assert_eq!(super::current_version(path).expect("version"), 3u32);
 		}
+	}
+
+	#[cfg(feature = "rocksdb")]
+	#[test]
+	fn upgrade_1_to_current_rocksdb_adds_missing_column_then_migrates() {
+		let tmp = tempdir().expect("create a temporary directory");
+		let db_path = tmp.path().to_owned();
+		let setting = crate::kv::DatabaseSettings {
+			source: sc_client_db::DatabaseSource::RocksDb {
+				path: db_path.clone(),
+				cache_size: 0,
+			},
+		};
+
+		let (client, _) = TestClientBuilder::new()
+			.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+			None,
+		);
+		let client = Arc::new(client);
+
+		let chain_info = client.chain_info();
+		let mut previous_canon_block_hash = chain_info.best_hash;
+		let mut previous_canon_block_number = chain_info.best_number;
+
+		let mut ethereum_hashes = vec![];
+		let mut substrate_hashes = vec![];
+		let mut transaction_hashes = vec![];
+		let mut block_numbers = vec![];
+		{
+			// Create an "old" RocksDB (v1) with 4 columns, unlike `upgrade_1_to_current_works`
+			// which creates it through the current backend and so already has the v3 column.
+			let db = kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V1_NUM_COLUMNS),
+				&db_path,
+			)
+			.expect("open/create v1 rocksdb");
+			let mut transaction = db.transaction();
+			for _ in 0..10 {
+				let ethhash = H256::random();
+				// Create two branches, and map the orphan one with the v1 encoding (Block::Hash).
+				// A1
+				let mut builder = BlockBuilderBuilder::new(&*client)
+					.on_parent_block(previous_canon_block_hash)
+					.with_parent_block_number(previous_canon_block_number)
+					.build()
+					.expect("build A1");
+				builder
+					.push_storage_change(vec![1], None)
+					.expect("push A1 storage change");
+				let block = builder.build().expect("build A1 block").block;
+				let next_canon_block_hash = block.header.hash();
+				let next_canon_block_number = *block.header.number();
+				executor::block_on(client.import(BlockOrigin::Own, block)).expect("import A1");
+				// A2
+				let mut builder = BlockBuilderBuilder::new(&*client)
+					.on_parent_block(previous_canon_block_hash)
+					.with_parent_block_number(previous_canon_block_number)
+					.build()
+					.expect("build A2");
+				builder
+					.push_storage_change(vec![2], None)
+					.expect("push A2 storage change");
+				let block = builder.build().expect("build A2 block").block;
+				let orphan_block_hash = block.header.hash();
+				executor::block_on(client.import(BlockOrigin::Own, block)).expect("import A2");
+
+				ethereum_hashes.push(ethhash);
+				substrate_hashes.push(next_canon_block_hash);
+				block_numbers.push(next_canon_block_number);
+				transaction.put_vec(
+					crate::kv::columns::BLOCK_MAPPING,
+					&ethhash.encode(),
+					orphan_block_hash.encode(),
+				);
+				let eth_tx_hash = H256::random();
+				let mut metadata = vec![];
+				for hash in [next_canon_block_hash, orphan_block_hash] {
+					metadata.push(crate::kv::TransactionMetadata::<OpaqueBlock> {
+						substrate_block_hash: hash,
+						ethereum_block_hash: ethhash,
+						ethereum_index: 0u32,
+					});
+				}
+				transaction.put_vec(
+					crate::kv::columns::TRANSACTION_MAPPING,
+					&eth_tx_hash.encode(),
+					metadata.encode(),
+				);
+				transaction_hashes.push(eth_tx_hash);
+				previous_canon_block_hash = next_canon_block_hash;
+				previous_canon_block_number = next_canon_block_number;
+			}
+			db.write(transaction).expect("commit v1 mappings");
+		} // DB closed here
+
+		// Write version file to indicate v1.
+		let mut version_file = std::fs::File::create(super::version_file_path(&db_path))
+			.expect("db version file created");
+		version_file.write_all(b"1").expect("write version 1");
+
+		super::upgrade_db::<OpaqueBlock, _>(client.clone(), &db_path, &setting.source)
+			.expect("upgrade v1->v3");
+		assert_eq!(super::current_version(&db_path).expect("version"), 3u32);
+
+		// Check data after migration through the current backend.
+		let backend = open_frontier_backend::<OpaqueBlock, _>(client, &setting)
+			.expect("open the upgraded db");
+		for (i, original_ethereum_hash) in ethereum_hashes.iter().enumerate() {
+			let canon_substrate_block_hash = substrate_hashes.get(i).expect("Block hash");
+			let block_number = *block_numbers.get(i).expect("Block number");
+			let mapped_block = backend
+				.mapping()
+				.block_hash(original_ethereum_hash)
+				.expect("block_hash")
+				.expect("mapped block");
+			assert_eq!(mapped_block.len(), 1);
+			assert_eq!(mapped_block.first(), Some(canon_substrate_block_hash));
+			let mapped_transaction = backend
+				.mapping()
+				.transaction_metadata(transaction_hashes.get(i).expect("Transaction hash"))
+				.expect("transaction_metadata");
+			assert!(mapped_transaction
+				.into_iter()
+				.any(|tx| tx.substrate_block_hash == *canon_substrate_block_hash));
+			let mapped_eth_hash = backend
+				.mapping()
+				.block_hash_by_number(block_number)
+				.expect("block_hash_by_number");
+			assert_eq!(mapped_eth_hash, Some(*original_ethereum_hash));
+		}
+	}
+
+	#[cfg(feature = "rocksdb")]
+	#[test]
+	fn rocksdb_v3_without_version_file_is_detected_as_v3() {
+		let tmp = tempdir().expect("create a temporary directory");
+		let db_path = tmp.path().to_owned();
+
+		let (client, _) = TestClientBuilder::new()
+			.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+			None,
+		);
+		let client = Arc::new(client);
+
+		// Create a v3 RocksDB (5 columns) with a BLOCK_MAPPING entry and its
+		// BLOCK_NUMBER_MAPPING entry, as mapping-sync writes them for a canonical block.
+		// Importantly: do NOT write a db_version file.
+		{
+			let db = kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+				&db_path,
+			)
+			.expect("open/create v3 rocksdb");
+			let eth_hash = H256::random();
+			let mut transaction = db.transaction();
+			transaction.put_vec(
+				crate::kv::columns::BLOCK_MAPPING,
+				&eth_hash.encode(),
+				vec![H256::random()].encode(),
+			);
+			transaction.put_vec(
+				crate::kv::columns::BLOCK_NUMBER_MAPPING,
+				&1u64.encode(),
+				eth_hash.encode(),
+			);
+			db.write(transaction).expect("commit v3 mappings");
+		} // DB closed here
+
+		assert!(
+			!super::version_file_path(&db_path).exists(),
+			"version file should not exist"
+		);
+
+		let detected =
+			super::detect_version_without_version_file_rocksdb::<OpaqueBlock, _>(client, &db_path)
+				.expect("detect version");
+		assert_eq!(detected, 3u32);
+	}
+
+	#[cfg(feature = "rocksdb")]
+	#[test]
+	fn empty_rocksdb_v3_without_version_file_is_detected_as_v3() {
+		let tmp = tempdir().expect("create a temporary directory");
+		let db_path = tmp.path().to_owned();
+
+		let (client, _) = TestClientBuilder::new()
+			.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+			None,
+		);
+		let client = Arc::new(client);
+
+		// Create an empty 5-column RocksDB without a db_version file.
+		kvdb_rocksdb::Database::open(
+			&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+			&db_path,
+		)
+		.expect("open/create v3 rocksdb");
+		assert!(
+			!super::version_file_path(&db_path).exists(),
+			"version file should not exist"
+		);
+
+		let detected =
+			super::detect_version_without_version_file_rocksdb::<OpaqueBlock, _>(client, &db_path)
+				.expect("detect version");
+		assert_eq!(detected, 3u32);
+	}
+
+	#[cfg(feature = "rocksdb")]
+	#[test]
+	fn rocksdb_v3_columns_with_v2_data_without_version_file_reruns_backfill() {
+		let tmp = tempdir().expect("create a temporary directory");
+		let db_path = tmp.path().to_owned();
+
+		let (client, _) = TestClientBuilder::new()
+			.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+			None,
+		);
+		let client = Arc::new(client);
+
+		// Import one block so the backfill can resolve its number.
+		let chain_info = client.chain_info();
+		let mut builder = BlockBuilderBuilder::new(&*client)
+			.on_parent_block(chain_info.best_hash)
+			.with_parent_block_number(chain_info.best_number)
+			.build()
+			.expect("build block");
+		builder
+			.push_storage_change(vec![1], None)
+			.expect("push storage change");
+		let block = builder.build().expect("build").block;
+		let substrate_hash = block.header.hash();
+		let block_number_u64: u64 = *block.header.number();
+		executor::block_on(client.import(BlockOrigin::Own, block)).expect("import block");
+
+		// 5 columns, v2-format BLOCK_MAPPING, empty BLOCK_NUMBER_MAPPING, no db_version file.
+		let eth_hash = H256::random();
+		{
+			let db = kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+				&db_path,
+			)
+			.expect("open/create 5-column rocksdb");
+			let mut transaction = db.transaction();
+			transaction.put_vec(
+				crate::kv::columns::BLOCK_MAPPING,
+				&eth_hash.encode(),
+				vec![substrate_hash].encode(), // v2 encoding: Vec<Block::Hash>
+			);
+			db.write(transaction).expect("commit v2 block mapping");
+		} // DB closed here
+
+		let detected = super::detect_version_without_version_file_rocksdb::<OpaqueBlock, _>(
+			client.clone(),
+			&db_path,
+		)
+		.expect("detect version");
+		assert_eq!(
+			detected, 2u32,
+			"5 columns with unmigrated v2 data must be detected as v2"
+		);
+
+		let source = sc_client_db::DatabaseSource::RocksDb {
+			path: db_path.clone(),
+			cache_size: 0,
+		};
+		super::upgrade_db::<OpaqueBlock, _>(client, &db_path, &source).expect("upgrade to v3");
+
+		let db = kvdb_rocksdb::Database::open(
+			&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+			&db_path,
+		)
+		.expect("open v3 rocksdb");
+		let raw = db
+			.get(
+				crate::kv::columns::BLOCK_NUMBER_MAPPING,
+				&block_number_u64.encode(),
+			)
+			.expect("get block number mapping")
+			.expect("block number mapping is backfilled");
+		assert_eq!(H256::decode(&mut &raw[..]).expect("decode H256"), eth_hash);
+
+		// Written as 3, so the next start reads the file and skips detection.
+		assert_eq!(super::current_version(&db_path).expect("version"), 3u32);
+	}
+
+	#[cfg(feature = "rocksdb")]
+	#[test]
+	fn rocksdb_v3_columns_with_v1_data_without_version_file_reruns_migrations() {
+		let tmp = tempdir().expect("create a temporary directory");
+		let db_path = tmp.path().to_owned();
+		let setting = crate::kv::DatabaseSettings {
+			source: sc_client_db::DatabaseSource::RocksDb {
+				path: db_path.clone(),
+				cache_size: 0,
+			},
+		};
+
+		let (client, _) = TestClientBuilder::new()
+			.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+			None,
+		);
+		let client = Arc::new(client);
+
+		// Import a canonical block A1 and an orphan A2 at the same height.
+		let chain_info = client.chain_info();
+		let mut builder = BlockBuilderBuilder::new(&*client)
+			.on_parent_block(chain_info.best_hash)
+			.with_parent_block_number(chain_info.best_number)
+			.build()
+			.expect("build A1");
+		builder
+			.push_storage_change(vec![1], None)
+			.expect("push A1 storage change");
+		let block = builder.build().expect("build A1 block").block;
+		let canon_hash = block.header.hash();
+		let block_number: u64 = *block.header.number();
+		executor::block_on(client.import(BlockOrigin::Own, block)).expect("import A1");
+		let mut builder = BlockBuilderBuilder::new(&*client)
+			.on_parent_block(chain_info.best_hash)
+			.with_parent_block_number(chain_info.best_number)
+			.build()
+			.expect("build A2");
+		builder
+			.push_storage_change(vec![2], None)
+			.expect("push A2 storage change");
+		let block = builder.build().expect("build A2 block").block;
+		let orphan_hash = block.header.hash();
+		executor::block_on(client.import(BlockOrigin::Own, block)).expect("import A2");
+
+		// 5 columns, v1-format BLOCK_MAPPING, empty BLOCK_NUMBER_MAPPING, no db_version file.
+		let eth_hash = H256::random();
+		{
+			let db = kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+				&db_path,
+			)
+			.expect("open/create 5-column rocksdb");
+			let mut transaction = db.transaction();
+			transaction.put_vec(
+				crate::kv::columns::BLOCK_MAPPING,
+				&eth_hash.encode(),
+				orphan_hash.encode(), // v1 encoding: Block::Hash
+			);
+			db.write(transaction).expect("commit v1 block mapping");
+		} // DB closed here
+
+		let detected = super::detect_version_without_version_file_rocksdb::<OpaqueBlock, _>(
+			client.clone(),
+			&db_path,
+		)
+		.expect("detect version");
+		assert_eq!(
+			detected, 1u32,
+			"5 columns with unmigrated v1 data must be detected as v1"
+		);
+
+		super::upgrade_db::<OpaqueBlock, _>(client.clone(), &db_path, &setting.source)
+			.expect("upgrade to v3");
+		assert_eq!(super::current_version(&db_path).expect("version"), 3u32);
+
+		let backend = open_frontier_backend::<OpaqueBlock, _>(client, &setting)
+			.expect("open the upgraded db");
+		let mapped_block = backend
+			.mapping()
+			.block_hash(&eth_hash)
+			.expect("block_hash")
+			.expect("mapped block");
+		assert_eq!(mapped_block, vec![canon_hash]);
+		assert_eq!(
+			backend
+				.mapping()
+				.block_hash_by_number(block_number)
+				.expect("block_hash_by_number"),
+			Some(eth_hash)
+		);
+	}
+
+	#[cfg(feature = "rocksdb")]
+	#[test]
+	fn rocksdb_v3_with_only_non_canonical_mapping_without_version_file_is_left_intact() {
+		let tmp = tempdir().expect("create a temporary directory");
+		let db_path = tmp.path().to_owned();
+
+		let (client, _) = TestClientBuilder::new()
+			.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+			None,
+		);
+		let client = Arc::new(client);
+
+		// Import a canonical block A1 and an orphan A2 at the same height.
+		let chain_info = client.chain_info();
+		let mut builder = BlockBuilderBuilder::new(&*client)
+			.on_parent_block(chain_info.best_hash)
+			.with_parent_block_number(chain_info.best_number)
+			.build()
+			.expect("build A1");
+		builder
+			.push_storage_change(vec![1], None)
+			.expect("push A1 storage change");
+		let block = builder.build().expect("build A1 block").block;
+		executor::block_on(client.import(BlockOrigin::Own, block)).expect("import A1");
+		let mut builder = BlockBuilderBuilder::new(&*client)
+			.on_parent_block(chain_info.best_hash)
+			.with_parent_block_number(chain_info.best_number)
+			.build()
+			.expect("build A2");
+		builder
+			.push_storage_change(vec![2], None)
+			.expect("push A2 storage change");
+		let block = builder.build().expect("build A2 block").block;
+		let orphan_hash = block.header.hash();
+		executor::block_on(client.import(BlockOrigin::Own, block)).expect("import A2");
+		assert_ne!(
+			client.hash(1).expect("hash at #1"),
+			Some(orphan_hash),
+			"A2 must not be canonical"
+		);
+
+		// A genuine v3 db that only mapped the orphan: mapping-sync writes no number
+		// mapping for a non-canonical block, so BLOCK_NUMBER_MAPPING is empty. No
+		// db_version file.
+		let eth_hash = H256::random();
+		{
+			let db = kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+				&db_path,
+			)
+			.expect("open/create 5-column rocksdb");
+			let mut transaction = db.transaction();
+			transaction.put_vec(
+				crate::kv::columns::BLOCK_MAPPING,
+				&eth_hash.encode(),
+				vec![orphan_hash].encode(),
+			);
+			db.write(transaction).expect("commit v3 block mapping");
+		} // DB closed here
+
+		// Detected as 2, not 1, so the 1->2 migration does not touch the v3 value.
+		let detected = super::detect_version_without_version_file_rocksdb::<OpaqueBlock, _>(
+			client.clone(),
+			&db_path,
+		)
+		.expect("detect version");
+		assert_eq!(detected, 2u32);
+
+		let source = sc_client_db::DatabaseSource::RocksDb {
+			path: db_path.clone(),
+			cache_size: 0,
+		};
+		super::upgrade_db::<OpaqueBlock, _>(client, &db_path, &source).expect("upgrade to v3");
+		assert_eq!(super::current_version(&db_path).expect("version"), 3u32);
+
+		let db = kvdb_rocksdb::Database::open(
+			&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+			&db_path,
+		)
+		.expect("open v3 rocksdb");
+		let raw = db
+			.get(crate::kv::columns::BLOCK_MAPPING, &eth_hash.encode())
+			.expect("get block mapping")
+			.expect("block mapping is kept");
+		assert_eq!(
+			Vec::<H256>::decode(&mut &raw[..]).expect("decode Vec<H256>"),
+			vec![orphan_hash],
+			"BLOCK_MAPPING must be left as it was"
+		);
+	}
+
+	#[cfg(feature = "rocksdb")]
+	#[test]
+	fn upgrade_rocksdb_without_version_file_detects_v2_and_migrates() {
+		let tmp = tempdir().expect("create a temporary directory");
+		let db_path = tmp.path().to_owned();
+
+		let (client, _) = TestClientBuilder::new()
+			.build_with_native_executor::<substrate_test_runtime_client::runtime::RuntimeApi, _>(
+			None,
+		);
+		let client = Arc::new(client);
+
+		// Build/import one block so we have a known block hash -> block number mapping.
+		let chain_info = client.chain_info();
+		let mut builder = BlockBuilderBuilder::new(&*client)
+			.on_parent_block(chain_info.best_hash)
+			.with_parent_block_number(chain_info.best_number)
+			.build()
+			.expect("build block");
+		builder
+			.push_storage_change(vec![1], None)
+			.expect("push storage change");
+		let block = builder.build().expect("build").block;
+		let substrate_hash = block.header.hash();
+		let block_number_u64: u64 = *block.header.number();
+		executor::block_on(client.import(BlockOrigin::Own, block)).expect("import block");
+
+		// Create an "old" RocksDB (v2) with 4 columns and a v2-style BLOCK_MAPPING entry.
+		// Importantly: do NOT write a db_version file.
+		let eth_hash = H256::random();
+		{
+			let db = kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V2_NUM_COLUMNS),
+				&db_path,
+			)
+			.expect("open/create v2 rocksdb");
+			let mut transaction = db.transaction();
+			transaction.put_vec(
+				crate::kv::columns::BLOCK_MAPPING,
+				&eth_hash.encode(),
+				vec![substrate_hash].encode(), // v2 encoding: Vec<Block::Hash>
+			);
+			db.write(transaction).expect("commit v2 block mapping");
+		} // DB closed here
+
+		assert!(
+			!super::version_file_path(&db_path).exists(),
+			"version file should not exist yet"
+		);
+
+		// The v3 probe runs first; a 4-column db must still be detected as v2, otherwise the
+		// v2->v3 backfill below is skipped without an error.
+		let detected = super::detect_version_without_version_file_rocksdb::<OpaqueBlock, _>(
+			client.clone(),
+			&db_path,
+		)
+		.expect("detect version");
+		assert_eq!(detected, 2u32, "a 4-column rocksdb must be detected as v2");
+
+		// The probe must not have added the missing column.
+		assert!(
+			kvdb_rocksdb::Database::open(
+				&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+				&db_path,
+			)
+			.is_err(),
+			"version detection must leave a 4-column rocksdb at 4 columns"
+		);
+
+		// Run upgrade: should detect v2, write the version file, add the new column, and backfill.
+		let source = sc_client_db::DatabaseSource::RocksDb {
+			path: db_path.clone(),
+			cache_size: 0,
+		};
+		super::upgrade_db::<OpaqueBlock, _>(client, &db_path, &source).expect("upgrade v2->v3");
+
+		// Verify the DB can now open with v3 column count and contains the backfilled mapping.
+		let db = kvdb_rocksdb::Database::open(
+			&kvdb_rocksdb::DatabaseConfig::with_columns(super::V3_NUM_COLUMNS),
+			&db_path,
+		)
+		.expect("open v3 rocksdb");
+
+		// New index is backfilled.
+		let raw = db
+			.get(
+				crate::kv::columns::BLOCK_NUMBER_MAPPING,
+				&block_number_u64.encode(),
+			)
+			.expect("get block number mapping")
+			.expect("block number mapping exists");
+		let decoded_eth = H256::decode(&mut &raw[..]).expect("decode H256");
+		assert_eq!(decoded_eth, eth_hash);
+
+		// Version file updated to current.
+		assert_eq!(super::current_version(&db_path).expect("version"), 3u32);
 	}
 
 	#[cfg(feature = "rocksdb")]
